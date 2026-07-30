@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: humus-cluster-controller
+  namespace: humus-cluster-controller
+  labels:
+    app: humus-cluster-controller
+spec:
+  replicas: 1
+  # Recreate: the operator runs kopf in standalone mode, so two live replicas
+  # would both handle events.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: humus-cluster-controller
+  template:
+    metadata:
+      labels:
+        app: humus-cluster-controller
+    spec:
+      serviceAccountName: humus-cluster-controller
+      containers:
+        - name: operator
+          # In the air-gapped environment, point this at the internal mirror.
+          image: sokushinbutsu/dappsoclusterr:1.0.0
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # helm writes temp files and caches under /tmp

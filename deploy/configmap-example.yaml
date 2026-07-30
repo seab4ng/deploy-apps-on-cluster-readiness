@@ -1,0 +1,62 @@
+# Example of the operator ConfigMap. Fill in real manifests/values before applying.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: humus-cluster-controller
+  namespace: humus-cluster-controller
+data:
+  # ---- base apps: full multi-document YAML manifests, applied as-is ----
+  shawarma-humus-longhorn.yaml: |
+    # ... Longhorn controller manifests ...
+  shawarma-humus-filebrowser.yaml: |
+    # ... FileBrowser controller manifests ...
+  shawarma-humus-pvc-controller.yaml: |
+    # ... PVC controller manifests ...
+
+  # ---- ArgoCD (used only for clusters labeled humus-argocd: "true") ----
+  # Internal Artifactory helm repo (air-gap: never a public URL).
+  # Classic https://... repo or oci://... registry are both supported.
+  argocd-chart-repo: "https://artifactory.example.com/artifactory/api/helm/helm-remote"
+  argocd-chart-version: "7.7.11"
+
+  # Values passed to helm with -f. Air-gap: MUST override the image
+  # registries to the internal mirror - chart defaults point at quay.io.
+  argocd-new-values.yaml: |
+    global:
+      image:
+        repository: registry.example.com/mirror/argoproj/argocd
+    # ... the rest of your altered values ...
+
+  # ApplicationSet template. The operator substitutes:
+  #   ${GITLAB_REPO_URL} and ${REVISION} - from the per-cluster argocd-repos-<name> secret
+  #   ${CLUSTER_NAME}    - the downstream cluster's name
+  argocd-applicationset.yaml: |
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: cluster-apps
+      namespace: argocd
+    spec:
+      goTemplate: true
+      generators:
+        - git:
+            repoURL: ${GITLAB_REPO_URL}
+            revision: ${REVISION}
+            files:
+              - path: argocd/${CLUSTER_NAME}/*.yaml
+      template:
+        metadata:
+          name: "{{.appName}}"
+        spec:
+          project: default
+          source:
+            repoURL: "{{.repoURL}}"
+            targetRevision: "{{.targetRevision}}"
+            path: "{{.path}}"
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: "{{.namespace}}"
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
