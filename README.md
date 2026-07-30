@@ -52,6 +52,11 @@ kubectl apply -f deploy/deployment.yaml
 
 ## Air-gapped environments
 
+To build the image *inside* the air-gapped environment (no internet, no
+apt-get), use [Dockerfile.airgap](Dockerfile.airgap): the base image, the helm
+tarball, and the pip packages all come from internal Artifactory via build args
+(see the header of that file for the full build command).
+
 The image is fully self-contained (python deps + helm binary baked in at build
 time); at runtime the operator only talks to the management API, the downstream
 API, and the internal Artifactory. Make sure:

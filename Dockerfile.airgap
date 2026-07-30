@@ -1,0 +1,42 @@
+# Air-gapped build: no internet, no apt-get. Everything comes from internal
+# Artifactory via build args:
+#
+#   docker build -f Dockerfile.airgap \
+#     --build-arg BASE_IMAGE=registry.internal/mirror/python:3.12-slim \
+#     --build-arg HELM_TGZ_URL=https://artifactory.internal/artifactory/generic-local/helm/helm-v3.16.4-linux-amd64.tar.gz \
+#     --build-arg PIP_INDEX_URL=https://artifactory.internal/artifactory/api/pypi/pypi-virtual/simple \
+#     -t registry.internal/dappsoclusterr:1.0.0 .
+#
+# Notes:
+# - HELM_TGZ_URL must be anonymously readable (ADD cannot authenticate, and a
+#   token embedded in the URL would leak into the image history). If your
+#   generic repo requires auth, download the tarball next to this Dockerfile
+#   and replace the ADD line with:  COPY helm-linux-amd64.tar.gz /tmp/helm.tar.gz
+# - If Artifactory uses a self-signed certificate, add to the pip line:
+#   --trusted-host artifactory.internal
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
+
+# Helm tarball fetched from internal Artifactory at build time (ADD downloads
+# URLs natively - no curl/apt needed); tar and gzip ship with the base image.
+ARG HELM_TGZ_URL
+ADD ${HELM_TGZ_URL} /tmp/helm.tar.gz
+RUN tar -xzf /tmp/helm.tar.gz --strip-components=1 -C /usr/local/bin linux-amd64/helm \
+ && rm /tmp/helm.tar.gz \
+ && helm version
+
+WORKDIR /app
+COPY requirements.txt .
+ARG PIP_INDEX_URL
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt
+
+COPY operator.py .
+
+# Run as non-root; helm needs writable cache/config dirs.
+ENV HELM_CACHE_HOME=/tmp/helm/cache \
+    HELM_CONFIG_HOME=/tmp/helm/config \
+    HELM_DATA_HOME=/tmp/helm/data
+RUN useradd --uid 1000 --no-create-home operator
+USER 1000
+
+CMD ["kopf", "run", "--standalone", "--all-namespaces", "/app/operator.py"]
