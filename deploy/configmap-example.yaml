@@ -2,18 +2,18 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: humus-cluster-controller
-  namespace: humus-cluster-controller
+  name: c4isr-cluster-controller
+  namespace: c4isr-cluster-controller
 data:
   # ---- base apps: full multi-document YAML manifests, applied as-is ----
-  shawarma-humus-longhorn.yaml: |
+  elta-c4isr-longhorn.yaml: |
     # ... Longhorn controller manifests ...
-  shawarma-humus-filebrowser.yaml: |
+  elta-c4isr-filebrowser.yaml: |
     # ... FileBrowser controller manifests ...
-  shawarma-humus-pvc-controller.yaml: |
+  elta-c4isr-pvc-controller.yaml: |
     # ... PVC controller manifests ...
 
-  # ---- ArgoCD (used only for clusters labeled humus-argocd: "true") ----
+  # ---- ArgoCD (used only for clusters labeled c4isr-argocd: "true") ----
   # Internal Artifactory helm repo (air-gap: never a public URL).
   # Classic https://... repo or oci://... registry are both supported.
   argocd-chart-repo: "https://artifactory.example.com/artifactory/api/helm/helm-remote"

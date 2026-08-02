@@ -4,9 +4,9 @@ Kopf operator for Rancher management clusters. When a downstream cluster
 (`provisioning.cattle.io/v1` Cluster) reaches `status.ready: true`, the operator:
 
 1. Deploys **Longhorn** (into `longhorn-system`) and the **FileBrowser + PVC
-   controllers** (into `shawarma-controllers-system`) from manifests stored in a
+   controllers** (into `elta-controllers-system`) from manifests stored in a
    ConfigMap.
-2. Optionally — if the Cluster object is labeled `humus-argocd: "true"` — installs
+2. Optionally — if the Cluster object is labeled `c4isr-argocd: "true"` — installs
    **ArgoCD** from a Helm chart, registers the cluster's GitLab (git) and
    Artifactory (helm) repositories in ArgoCD, and applies an **ApplicationSet**
    whose git generator points at `argocd/<cluster-name>/*.yaml`.
@@ -18,19 +18,19 @@ missing; `helm upgrade --install` converges the ArgoCD release.
 
 | Label | Effect |
 |---|---|
-| `humus-ignore: apps` | Skip this cluster entirely (nothing installed) |
-| `humus-argocd: "true"` | Also deploy the ArgoCD stack |
+| `c4isr-ignore: apps` | Skip this cluster entirely (nothing installed) |
+| `c4isr-argocd: "true"` | Also deploy the ArgoCD stack |
 
 ## Configuration
 
-**ConfigMap** `humus-cluster-controller/humus-cluster-controller` (shared, see
+**ConfigMap** `c4isr-cluster-controller/c4isr-cluster-controller` (shared, see
 [deploy/configmap-example.yaml](deploy/configmap-example.yaml)):
 
 | Key | Content |
 |---|---|
-| `shawarma-humus-longhorn.yaml` | Longhorn manifests |
-| `shawarma-humus-filebrowser.yaml` | FileBrowser controller manifests |
-| `shawarma-humus-pvc-controller.yaml` | PVC controller manifests |
+| `elta-c4isr-longhorn.yaml` | Longhorn manifests |
+| `elta-c4isr-filebrowser.yaml` | FileBrowser controller manifests |
+| `elta-c4isr-pvc-controller.yaml` | PVC controller manifests |
 | `argocd-chart-repo` | Helm repo with the argo-cd chart (`https://...` or `oci://...`) |
 | `argocd-chart-version` | Chart version to install |
 | `argocd-new-values.yaml` | Values passed to helm with `-f` |

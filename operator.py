@@ -1,12 +1,12 @@
 """
-Kopf operator: deploy humus apps onto Rancher downstream clusters once they are ready.
+Kopf operator: deploy c4isr apps onto Rancher downstream clusters once they are ready.
 
 Watches provisioning.cattle.io/v1 Cluster objects. A brand-new Cluster object with
 no machines attached is not ready for deployments, so we wait for status.ready == True,
-then deploy Longhorn and the other humus controllers (FileBrowser, PVC controller)
+then deploy Longhorn and the other c4isr controllers (FileBrowser, PVC controller)
 onto the downstream cluster.
 
-Optionally (label humus-argocd: "true" on the Cluster object) it also installs ArgoCD
+Optionally (label c4isr-argocd: "true" on the Cluster object) it also installs ArgoCD
 from its Helm chart, registers the cluster's GitLab and Artifactory repositories in
 ArgoCD, and applies an ApplicationSet whose git generator points at
 argocd/<cluster-name>/*.yaml in the GitLab repo.
@@ -34,24 +34,24 @@ from kubernetes.dynamic import DynamicClient
 LOCAL_CLUSTER_NAME = "local"
 
 # Labels set through the cluster-creation job in Jenkins (or manually).
-IGNORE_LABEL_KEY = "humus-ignore"    # humus-ignore: apps  -> skip this cluster entirely
+IGNORE_LABEL_KEY = "c4isr-ignore"    # c4isr-ignore: apps  -> skip this cluster entirely
 IGNORE_LABEL_VALUE = "apps"
-ARGOCD_LABEL_KEY = "humus-argocd"    # humus-argocd: "true" -> also deploy the ArgoCD stack
+ARGOCD_LABEL_KEY = "c4isr-argocd"    # c4isr-argocd: "true" -> also deploy the ArgoCD stack
 ARGOCD_LABEL_VALUE = "true"
 
 # ConfigMap on the management cluster holding manifests and shared ArgoCD settings.
-CONFIGMAP_NAMESPACE = "humus-cluster-controller"
-CONFIGMAP_NAME = "humus-cluster-controller"
+CONFIGMAP_NAMESPACE = "c4isr-cluster-controller"
+CONFIGMAP_NAME = "c4isr-cluster-controller"
 
 # Longhorn must be deployed in longhorn-system according to the docs.
 LONGHORN_NAMESPACE = "longhorn-system"
 # Namespace for all other controllers.
-CONTROLLERS_NAMESPACE = "shawarma-controllers-system"
+CONTROLLERS_NAMESPACE = "elta-controllers-system"
 
 # Base-apps keys inside the ConfigMap.
-LONGHORN_MANIFEST = "shawarma-humus-longhorn.yaml"
-FILEBROWSER_MANIFEST = "shawarma-humus-filebrowser.yaml"
-PVC_CONTROLLER_MANIFEST = "shawarma-humus-pvc-controller.yaml"
+LONGHORN_MANIFEST = "elta-c4isr-longhorn.yaml"
+FILEBROWSER_MANIFEST = "elta-c4isr-filebrowser.yaml"
+PVC_CONTROLLER_MANIFEST = "elta-c4isr-pvc-controller.yaml"
 MANIFEST_KEYS = (LONGHORN_MANIFEST, FILEBROWSER_MANIFEST, PVC_CONTROLLER_MANIFEST)
 
 # ArgoCD keys inside the ConfigMap.
@@ -97,7 +97,7 @@ def cluster_is_ready(body, **_) -> bool:
 def startup(logger, **_):
     # Load the management-cluster config once, instead of in every handler call.
     kubernetes.config.load_incluster_config()
-    logger.info("humus cluster controller started; watching provisioning.cattle.io Clusters.")
+    logger.info("c4isr cluster controller started; watching provisioning.cattle.io Clusters.")
 
 
 @kopf.on.resume("provisioning.cattle.io", "v1", "Cluster", when=cluster_is_ready)
@@ -112,7 +112,7 @@ def on_cluster_ready(name, meta, logger, **_):
     labels = meta.get("labels", {})
     if labels.get(IGNORE_LABEL_KEY) == IGNORE_LABEL_VALUE:
         logger.info(
-            f"humus apps such as Longhorn and FileBrowser will NOT be installed on cluster {name}. "
+            f"c4isr apps such as Longhorn and FileBrowser will NOT be installed on cluster {name}. "
             f"This behavior is defined by the label {IGNORE_LABEL_KEY}: {IGNORE_LABEL_VALUE} "
             "attached to this cluster object."
         )
@@ -139,11 +139,11 @@ def on_cluster_ready(name, meta, logger, **_):
     )
 
     if longhorn_created:
-        logger.info(f"humus Longhorn has been deployed on cluster: {name}")
+        logger.info(f"c4isr Longhorn has been deployed on cluster: {name}")
     if controllers_created:
-        logger.info(f"humus FileBrowser and PVC controllers have been deployed on cluster: {name}")
+        logger.info(f"c4isr FileBrowser and PVC controllers have been deployed on cluster: {name}")
     if not longhorn_created and not controllers_created:
-        logger.debug(f"All humus apps already present on cluster {name}; nothing to do.")
+        logger.debug(f"All c4isr apps already present on cluster {name}; nothing to do.")
 
     # Optional ArgoCD stack, opted in per cluster via label.
     if labels.get(ARGOCD_LABEL_KEY) == ARGOCD_LABEL_VALUE:
@@ -267,13 +267,13 @@ def create_argocd_repo_secrets(api_client: ApiClient, repos: dict, logger):
     """
     core = kubernetes.client.CoreV1Api(api_client)
     repo_secrets = {
-        "humus-gitlab-repo": {
+        "c4isr-gitlab-repo": {
             "type": "git",
             "url": repos["gitlab-repo-url"],
             "username": repos["username"],
             "password": repos["password"],
         },
-        "humus-artifactory-helm-repo": {
+        "c4isr-artifactory-helm-repo": {
             "type": "helm",
             "name": "artifactory",
             "url": repos["artifactory-helm-url"],

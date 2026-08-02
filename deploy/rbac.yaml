@@ -1,17 +1,17 @@
-# RBAC for the humus cluster controller.
+# RBAC for the c4isr cluster controller.
 # The operator runs on the Rancher management cluster; everything it does on
 # downstream clusters goes through the downstream kubeconfig, so no RBAC is
 # needed there.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: humus-cluster-controller
+  name: c4isr-cluster-controller
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: humus-cluster-controller
-  namespace: humus-cluster-controller
+  name: c4isr-cluster-controller
+  namespace: c4isr-cluster-controller
 ---
 # Watch Cluster objects cluster-wide; kopf stores its progress/diff state in
 # annotations on the watched object, hence "patch". Events are posted next to
@@ -19,7 +19,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: humus-cluster-controller
+  name: c4isr-cluster-controller
 rules:
   - apiGroups: ["provisioning.cattle.io"]
     resources: ["clusters"]
@@ -31,21 +31,21 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: humus-cluster-controller
+  name: c4isr-cluster-controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: humus-cluster-controller
+  name: c4isr-cluster-controller
 subjects:
   - kind: ServiceAccount
-    name: humus-cluster-controller
-    namespace: humus-cluster-controller
+    name: c4isr-cluster-controller
+    namespace: c4isr-cluster-controller
 ---
 # Read the <cluster>-kubeconfig secrets Rancher creates.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: humus-cluster-controller-kubeconfigs
+  name: c4isr-cluster-controller-kubeconfigs
   namespace: fleet-default
 rules:
   - apiGroups: [""]
@@ -55,23 +55,23 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: humus-cluster-controller-kubeconfigs
+  name: c4isr-cluster-controller-kubeconfigs
   namespace: fleet-default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: humus-cluster-controller-kubeconfigs
+  name: c4isr-cluster-controller-kubeconfigs
 subjects:
   - kind: ServiceAccount
-    name: humus-cluster-controller
-    namespace: humus-cluster-controller
+    name: c4isr-cluster-controller
+    namespace: c4isr-cluster-controller
 ---
 # Read the operator ConfigMap and the per-cluster argocd-repos-<name> secrets.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: humus-cluster-controller-config
-  namespace: humus-cluster-controller
+  name: c4isr-cluster-controller-config
+  namespace: c4isr-cluster-controller
 rules:
   - apiGroups: [""]
     resources: ["configmaps", "secrets"]
@@ -80,13 +80,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: humus-cluster-controller-config
-  namespace: humus-cluster-controller
+  name: c4isr-cluster-controller-config
+  namespace: c4isr-cluster-controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: humus-cluster-controller-config
+  name: c4isr-cluster-controller-config
 subjects:
   - kind: ServiceAccount
-    name: humus-cluster-controller
-    namespace: humus-cluster-controller
+    name: c4isr-cluster-controller
+    namespace: c4isr-cluster-controller
