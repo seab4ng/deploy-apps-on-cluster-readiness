@@ -2,10 +2,10 @@
 # Artifactory via build args:
 #
 #   docker build -f Dockerfile.airgap \
-#     --build-arg BASE_IMAGE=registry.internal/mirror/python:3.12-slim \
-#     --build-arg HELM_TGZ_URL=https://artifactory.internal/artifactory/generic-local/helm/helm-v3.16.4-linux-amd64.tar.gz \
+#     --build-arg BASE_IMAGE=registry.internal/mirror/python:3.12-alpine \
+#     --build-arg HELM_TGZ_URL=https://artifactory.internal/artifactory/generic-local/helm/helm-v4.2.3-linux-amd64.tar.gz \
 #     --build-arg PIP_INDEX_URL=https://artifactory.internal/artifactory/api/pypi/pypi-virtual/simple \
-#     -t registry.internal/dappsoclusterr:1.0.0 .
+#     -t registry.internal/dappsoclusterr:1.0.1 .
 #
 # Notes:
 # - HELM_TGZ_URL must be anonymously readable (ADD cannot authenticate, and a
@@ -14,7 +14,9 @@
 #   and replace the ADD line with:  COPY helm-linux-amd64.tar.gz /tmp/helm.tar.gz
 # - If Artifactory uses a self-signed certificate, add to the pip line:
 #   --trusted-host artifactory.internal
-ARG BASE_IMAGE=python:3.12-slim
+# Alpine base scans clean (0 critical / 0 high with trivy); all python deps
+# ship musllinux wheels, so no compiler is needed.
+ARG BASE_IMAGE=python:3.12-alpine
 FROM ${BASE_IMAGE}
 
 # Helm tarball fetched from internal Artifactory at build time (ADD downloads

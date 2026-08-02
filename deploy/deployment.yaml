@@ -23,7 +23,7 @@ spec:
       containers:
         - name: operator
           # In the air-gapped environment, point this at the internal mirror.
-          image: sokushinbutsu/dappsoclusterr:1.0.0
+          image: sokushinbutsu/dappsoclusterr:1.0.1
           resources:
             requests:
               cpu: 100m
