@@ -18,11 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY operator.py .
 
-# Run as non-root; helm needs writable cache/config dirs.
+# POC environment: runs as root deliberately, same as Dockerfile.airgap.
+# Helm cache/config dirs kept explicit for tidiness.
 ENV HELM_CACHE_HOME=/tmp/helm/cache \
     HELM_CONFIG_HOME=/tmp/helm/config \
     HELM_DATA_HOME=/tmp/helm/data
-RUN useradd --uid 1000 --no-create-home operator
-USER 1000
 
 CMD ["kopf", "run", "--standalone", "--all-namespaces", "/app/operator.py"]
