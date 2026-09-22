@@ -94,10 +94,31 @@ def cluster_is_ready(body, **_) -> bool:
 
 
 @kopf.on.startup()
-def startup(logger, **_):
+def startup(settings: kopf.OperatorSettings, logger, **_):
     # Load the management-cluster config once, instead of in every handler call.
     kubernetes.config.load_incluster_config()
+
+    # Watch streams must be time-bounded. A watch whose TCP connection dies
+    # without a proper close (apiserver restart, LB/conntrack drop) otherwise
+    # hangs forever: kopf keeps waiting on a dead socket, receives no events,
+    # and silently stops noticing new clusters until the pod is restarted.
+    # With these limits the server ends every watch after 10 minutes and the
+    # client kills it slightly later even if the server never answers; kopf
+    # then reconnects and re-lists, catching up on anything missed.
+    settings.watching.server_timeout = 600
+    settings.watching.client_timeout = 660
+    settings.watching.connect_timeout = 60
+
     logger.info("c4isr cluster controller started; watching provisioning.cattle.io Clusters.")
+
+
+@kopf.on.create("provisioning.cattle.io", "v1", "Cluster")
+def on_cluster_created(name, body, logger, **_):
+    # Purely informational: make new clusters visible in the logs immediately,
+    # even while they are not ready yet (deployment happens in on_cluster_ready).
+    ready = body.get("status", {}).get("ready") is True
+    logger.info(f"Cluster {name} detected (ready={ready}); "
+                "c4isr apps will be deployed once status.ready is True.")
 
 
 @kopf.on.resume("provisioning.cattle.io", "v1", "Cluster", when=cluster_is_ready)
