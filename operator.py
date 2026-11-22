@@ -97,9 +97,11 @@ HELM_SUBPROCESS_TIMEOUT_SECONDS = float(os.environ.get("HELM_SUBPROCESS_TIMEOUT_
 KUBECONFIG_SECRET_NAMESPACE = "fleet-default"
 
 # Watch, HTTP client, and retry settings (overridable via env vars for testing/tuning).
-WATCH_SERVER_TIMEOUT = float(os.environ.get("WATCH_SERVER_TIMEOUT", "180"))
-WATCH_CLIENT_TIMEOUT = float(os.environ.get("WATCH_CLIENT_TIMEOUT", "210"))
-WATCH_CONNECT_TIMEOUT = float(os.environ.get("WATCH_CONNECT_TIMEOUT", "30"))
+# Note: server_timeout MUST be an int because Kopf passes it as ?timeoutSeconds=<val>
+# to kube-apiserver, which parses it with Go strconv.ParseInt (rejecting "180.0").
+WATCH_SERVER_TIMEOUT = int(float(os.environ.get("WATCH_SERVER_TIMEOUT", "180")))
+WATCH_CLIENT_TIMEOUT = int(float(os.environ.get("WATCH_CLIENT_TIMEOUT", "210")))
+WATCH_CONNECT_TIMEOUT = int(float(os.environ.get("WATCH_CONNECT_TIMEOUT", "30")))
 WATCH_INACTIVITY_TIMEOUT = float(os.environ.get("WATCH_INACTIVITY_TIMEOUT", "70"))
 NETWORK_REQUEST_TIMEOUT = float(os.environ.get("NETWORK_REQUEST_TIMEOUT", "60"))
 NETWORK_ERROR_BACKOFFS = tuple(
