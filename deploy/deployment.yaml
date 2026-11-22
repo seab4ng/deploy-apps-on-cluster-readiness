@@ -23,7 +23,18 @@ spec:
       containers:
         - name: operator
           # In the air-gapped environment, point this at the internal mirror.
-          image: sokushinbutsu/dappsoclusterr:1.0.1
+          image: sokushinbutsu/dappsoclusterr:1.0.3
+          ports:
+            - name: healthz
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m

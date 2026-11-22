@@ -50,6 +50,10 @@ kubectl apply -f deploy/configmap-example.yaml   # after filling it in
 kubectl apply -f deploy/deployment.yaml
 ```
 
+The operator exposes a Kopf liveness probe at `http://0.0.0.0:8080/healthz`
+(configured in [deploy/deployment.yaml](deploy/deployment.yaml)) that verifies
+the `Cluster` watch stream is active and no reconciliation worker is wedged.
+
 ## Air-gapped environments
 
 To build the image *inside* the air-gapped environment (no internet, no

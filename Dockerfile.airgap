@@ -5,15 +5,15 @@
 #     --build-arg BASE_IMAGE=registry.internal/mirror/python:3.12-alpine \
 #     --build-arg HELM_TGZ_URL=https://artifactory.internal/artifactory/generic-local/helm/helm-v4.2.3-linux-amd64.tar.gz \
 #     --build-arg PIP_INDEX_URL=https://artifactory.internal/artifactory/api/pypi/pypi-virtual/simple \
-#     -t registry.internal/dappsoclusterr:1.0.1 .
+#     -t registry.internal/dappsoclusterr:1.0.3 .
 #
 # Notes:
 # - HELM_TGZ_URL must be anonymously readable (ADD cannot authenticate, and a
 #   token embedded in the URL would leak into the image history). If your
 #   generic repo requires auth, download the tarball next to this Dockerfile
 #   and replace the ADD line with:  COPY helm-linux-amd64.tar.gz /tmp/helm.tar.gz
-# - If Artifactory uses a self-signed certificate, add to the pip line:
-#   --trusted-host artifactory.internal
+# - If Artifactory uses a self-signed certificate, ensure your BASE_IMAGE trusts
+#   your internal root CA bundle (e.g. via SSL_CERT_FILE).
 # Alpine base scans clean (0 critical / 0 high with trivy); all python deps
 # ship musllinux wheels, so no compiler is needed.
 ARG BASE_IMAGE=python:3.12-alpine
@@ -36,8 +36,11 @@ COPY operator.py .
 
 # POC environment: runs as root deliberately (keeps the air-gapped build free
 # of user-setup steps). Helm cache/config dirs kept explicit for tidiness.
-ENV HELM_CACHE_HOME=/tmp/helm/cache \
+ENV PYTHONSAFEPATH=1 \
+    HELM_CACHE_HOME=/tmp/helm/cache \
     HELM_CONFIG_HOME=/tmp/helm/config \
     HELM_DATA_HOME=/tmp/helm/data
 
-CMD ["kopf", "run", "--standalone", "--all-namespaces", "/app/operator.py"]
+EXPOSE 8080
+
+CMD ["kopf", "run", "--standalone", "--all-namespaces", "--liveness=http://0.0.0.0:8080/healthz", "/app/operator.py"]

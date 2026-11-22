@@ -19,8 +19,11 @@ COPY operator.py .
 
 # POC environment: runs as root deliberately, same as Dockerfile.airgap.
 # Helm cache/config dirs kept explicit for tidiness.
-ENV HELM_CACHE_HOME=/tmp/helm/cache \
+ENV PYTHONSAFEPATH=1 \
+    HELM_CACHE_HOME=/tmp/helm/cache \
     HELM_CONFIG_HOME=/tmp/helm/config \
     HELM_DATA_HOME=/tmp/helm/data
 
-CMD ["kopf", "run", "--standalone", "--all-namespaces", "/app/operator.py"]
+EXPOSE 8080
+
+CMD ["kopf", "run", "--standalone", "--all-namespaces", "--liveness=http://0.0.0.0:8080/healthz", "/app/operator.py"]

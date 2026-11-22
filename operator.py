@@ -18,17 +18,27 @@ The downstream cluster is reached via the kubeconfig Secret that Rancher creates
 in fleet-default.
 """
 
+import asyncio
 import base64
+import contextlib
+import itertools
+import os
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 from string import Template
 
 import kopf
 import kubernetes
 import yaml
 from kubernetes.client import ApiClient, ApiException, Configuration
+from kubernetes.config.config_exception import ConfigException
 from kubernetes.config.kube_config import KubeConfigLoader
 from kubernetes.dynamic import DynamicClient
+from kubernetes.dynamic.exceptions import ResourceNotFoundError, ResourceNotUniqueError
+from urllib3.exceptions import HTTPError
 
 # Rancher's own management cluster - never deploy apps there.
 LOCAL_CLUSTER_NAME = "local"
@@ -80,36 +90,174 @@ ARGOCD_REPOS_SECRET_KEYS = (
 ARGOCD_NAMESPACE = "argocd"
 ARGOCD_RELEASE_NAME = "argocd"
 ARGOCD_CHART_NAME = "argo-cd"
-HELM_TIMEOUT = "10m"
-HELM_SUBPROCESS_TIMEOUT_SECONDS = 660  # a bit above helm's own --timeout
+HELM_TIMEOUT = os.environ.get("HELM_TIMEOUT", "10m")
+HELM_SUBPROCESS_TIMEOUT_SECONDS = float(os.environ.get("HELM_SUBPROCESS_TIMEOUT_SECONDS", "660"))
 
 # Rancher stores each downstream cluster kubeconfig here as <cluster>-kubeconfig.
 KUBECONFIG_SECRET_NAMESPACE = "fleet-default"
 
-RETRY_DELAY_SECONDS = 30
+# Watch, HTTP client, and retry settings (overridable via env vars for testing/tuning).
+WATCH_SERVER_TIMEOUT = float(os.environ.get("WATCH_SERVER_TIMEOUT", "180"))
+WATCH_CLIENT_TIMEOUT = float(os.environ.get("WATCH_CLIENT_TIMEOUT", "210"))
+WATCH_CONNECT_TIMEOUT = float(os.environ.get("WATCH_CONNECT_TIMEOUT", "30"))
+WATCH_INACTIVITY_TIMEOUT = float(os.environ.get("WATCH_INACTIVITY_TIMEOUT", "70"))
+NETWORK_REQUEST_TIMEOUT = float(os.environ.get("NETWORK_REQUEST_TIMEOUT", "60"))
+NETWORK_ERROR_BACKOFFS = tuple(
+    float(x)
+    for x in os.environ.get("NETWORK_ERROR_BACKOFFS", "1,2,4,8,15,30,30,30,30").split(",")
+    if x.strip()
+)
+
+K8S_CONNECT_TIMEOUT = float(os.environ.get("K8S_CONNECT_TIMEOUT", "10"))
+K8S_READ_TIMEOUT = float(os.environ.get("K8S_READ_TIMEOUT", "30"))
+DEFAULT_API_TIMEOUT = (K8S_CONNECT_TIMEOUT, K8S_READ_TIMEOUT)
+
+RETRY_DELAY_SECONDS = float(os.environ.get("RETRY_DELAY_SECONDS", "30"))
+EXECUTOR_MAX_WORKERS = int(os.environ.get("EXECUTOR_MAX_WORKERS", "16"))
+STARTUP_GRACE_SECONDS = float(os.environ.get("STARTUP_GRACE_SECONDS", "30"))
+HANDLER_STUCK_SECONDS = float(
+    os.environ.get("HANDLER_STUCK_SECONDS", str(int(HELM_SUBPROCESS_TIMEOUT_SECONDS + 240)))
+)
+
+# Runtime state tracked for liveness probes and in-process watchdog.
+_startup_monotonic: float = time.monotonic()
+_watchdog_task: asyncio.Task | None = None
+_invocation_counter = itertools.count(1)
+_active_handlers_lock = threading.Lock()
+_active_handlers: dict[int, tuple[str, float]] = {}
+WATCHDOG_INTERVAL_SECONDS = float(os.environ.get("WATCHDOG_INTERVAL_SECONDS", "30"))
+
+# Transport/socket exceptions that can escape urllib3 when connections drop or time out.
+TRANSPORT_EXCEPTIONS = (HTTPError, TimeoutError, OSError)
+
+
+class TimeoutApiClient(ApiClient):
+    """Kubernetes ApiClient that enforces socket timeouts on every call and cleans up pools.
+
+    Without an explicit _request_timeout, urllib3 defaults to timeout=None (infinite wait),
+    which permanently freezes handler threads on half-open/blackholed connections (including
+    internal DynamicClient /version and /apis discovery requests).
+    """
+
+    def __init__(self, configuration: Configuration | None = None, timeout=DEFAULT_API_TIMEOUT, **kwargs):
+        if configuration is None:
+            configuration = Configuration.get_default_copy()
+        # Disable hidden urllib3 retries so dead endpoints fail fast within K8S_CONNECT_TIMEOUT
+        # and let Kopf manage retries explicitly via TemporaryError.
+        configuration.retries = False
+        super().__init__(configuration=configuration, **kwargs)
+        self._default_timeout = timeout
+
+    def call_api(self, *args, **kwargs):
+        if kwargs.get("_request_timeout") is None:
+            kwargs["_request_timeout"] = self._default_timeout
+        return super().call_api(*args, **kwargs)
+
+    def close(self):
+        super().close()
+        if hasattr(self, "rest_client") and hasattr(self.rest_client, "pool_manager"):
+            self.rest_client.pool_manager.clear()
 
 
 def cluster_is_ready(body, **_) -> bool:
     return body.get("status", {}).get("ready") is True
 
 
-@kopf.on.startup()
-def startup(settings: kopf.OperatorSettings, logger, **_):
-    # Load the management-cluster config once, instead of in every handler call.
-    kubernetes.config.load_incluster_config()
+def _check_health_state() -> dict:
+    """Validate that the Cluster watch stream is alive and no handler thread is wedged."""
+    now = time.monotonic()
+    uptime = now - _startup_monotonic
 
-    # Watch streams must be time-bounded. A watch whose TCP connection dies
-    # without a proper close (apiserver restart, LB/conntrack drop) otherwise
-    # hangs forever: kopf keeps waiting on a dead socket, receives no events,
-    # and silently stops noticing new clusters until the pod is restarted.
-    # With these limits the server ends every watch after 10 minutes and the
-    # client kills it slightly later even if the server never answers; kopf
-    # then reconnects and re-lists, catching up on anything missed.
-    settings.watching.server_timeout = 600
-    settings.watching.client_timeout = 660
-    settings.watching.connect_timeout = 60
+    if uptime >= STARTUP_GRACE_SECONDS:
+        watcher_alive = any(
+            not task.done() and task.get_name().startswith("watcher for clusters.")
+            for task in asyncio.all_tasks()
+        )
+        if not watcher_alive:
+            raise RuntimeError("Cluster watcher task is not running.")
+
+    with _active_handlers_lock:
+        active_snapshot = list(_active_handlers.values())
+
+    for cluster_name, started_at in active_snapshot:
+        elapsed = now - started_at
+        if elapsed > HANDLER_STUCK_SECONDS:
+            raise RuntimeError(
+                f"Handler for cluster {cluster_name} has been stuck for {elapsed:.0f}s."
+            )
+
+    return {
+        "uptime_seconds": round(uptime, 1),
+        "active_handlers": len(active_snapshot),
+    }
+
+
+async def _watchdog_loop(logger):
+    """Self-terminate on unrecoverable state even if K8s livenessProbe is not configured."""
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+        try:
+            _check_health_state()
+        except Exception as e:
+            logger.critical(f"Watchdog detected unhealthy operator state ({e}); terminating for pod restart.")
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+
+@kopf.on.startup()
+async def startup(settings: kopf.OperatorSettings, logger, **_):
+    global _startup_monotonic, _watchdog_task
+    _startup_monotonic = time.monotonic()
+
+    # Load management-cluster config once; fall back to kubeconfig for local development.
+    try:
+        kubernetes.config.load_incluster_config()
+    except ConfigException:
+        kubernetes.config.load_kube_config()
+
+    # Persist handler progress and diffbase strictly in metadata.annotations.
+    # Kopf's default SmartProgressStorage also patches status.kopf on clusters/status,
+    # which fails with 403 Forbidden under our least-privilege RBAC and conflicts with Rancher.
+    settings.persistence.progress_storage = kopf.AnnotationsProgressStorage()
+    settings.persistence.diffbase_storage = kopf.AnnotationsDiffBaseStorage()
+
+    # Disable dynamic CRD/namespace watch scanning: the Cluster CRD already exists at
+    # startup and the operator ServiceAccount intentionally does not watch CRDs.
+    settings.scanning.disabled = True
+
+    # Bound every watch stream and HTTP request well below typical 5-minute LB/firewall
+    # conntrack idle timeouts. Kopf 1.45+ also requests watch bookmarks (every ~60s) and
+    # reconnects automatically after inactivity_timeout (70s) if a socket silently dies.
+    settings.watching.server_timeout = WATCH_SERVER_TIMEOUT
+    settings.watching.client_timeout = WATCH_CLIENT_TIMEOUT
+    settings.watching.connect_timeout = WATCH_CONNECT_TIMEOUT
+    settings.watching.inactivity_timeout = WATCH_INACTIVITY_TIMEOUT
+
+    settings.networking.connect_timeout = WATCH_CONNECT_TIMEOUT
+    settings.networking.request_timeout = NETWORK_REQUEST_TIMEOUT
+    settings.networking.error_backoffs = NETWORK_ERROR_BACKOFFS
+
+    settings.execution.max_workers = EXECUTOR_MAX_WORKERS
+
+    _watchdog_task = asyncio.create_task(_watchdog_loop(logger), name="c4isr-health-watchdog")
 
     logger.info("c4isr cluster controller started; watching provisioning.cattle.io Clusters.")
+
+
+@kopf.on.cleanup()
+async def cleanup(**_):
+    global _watchdog_task
+    if _watchdog_task is not None:
+        _watchdog_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _watchdog_task
+        _watchdog_task = None
+
+
+@kopf.on.probe(id="watcher_alive")
+async def probe_health(**_):
+    """Verify the Cluster watch task is active and no handler thread is wedged."""
+    return _check_health_state()
 
 
 @kopf.on.create("provisioning.cattle.io", "v1", "Cluster")
@@ -117,13 +265,14 @@ def on_cluster_created(name, body, logger, **_):
     # Purely informational: make new clusters visible in the logs immediately,
     # even while they are not ready yet (deployment happens in on_cluster_ready).
     ready = body.get("status", {}).get("ready") is True
-    logger.info(f"Cluster {name} detected (ready={ready}); "
-                "c4isr apps will be deployed once status.ready is True.")
+    logger.info(
+        f"Cluster {name} detected (ready={ready}); "
+        "c4isr apps will be deployed once status.ready is True."
+    )
 
 
 @kopf.on.resume("provisioning.cattle.io", "v1", "Cluster", when=cluster_is_ready)
-@kopf.on.field("provisioning.cattle.io", "v1", "Cluster",
-               field="status.ready", when=cluster_is_ready)
+@kopf.on.field("provisioning.cattle.io", "v1", "Cluster", field="status.ready", when=cluster_is_ready)
 def on_cluster_ready(name, meta, logger, **_):
     # Skip the main local cluster of Rancher.
     if name == LOCAL_CLUSTER_NAME:
@@ -139,47 +288,70 @@ def on_cluster_ready(name, meta, logger, **_):
         )
         return
 
-    config = get_configmap_data()
-    require_keys(f"ConfigMap {CONFIGMAP_NAMESPACE}/{CONFIGMAP_NAME}", config, MANIFEST_KEYS)
+    invocation_id = next(_invocation_counter)
+    with _active_handlers_lock:
+        _active_handlers[invocation_id] = (name, time.monotonic())
 
-    kubeconfig = get_downstream_kubeconfig(name)
-    downstream = build_downstream_client(kubeconfig)
+    try:
+        with build_management_client() as mgmt_client:
+            config = get_configmap_data(mgmt_client)
+            require_keys(f"ConfigMap {CONFIGMAP_NAMESPACE}/{CONFIGMAP_NAME}", config, MANIFEST_KEYS)
+            kubeconfig = get_downstream_kubeconfig(mgmt_client, name)
 
-    ensure_namespace(downstream, LONGHORN_NAMESPACE, logger)
-    ensure_namespace(downstream, CONTROLLERS_NAMESPACE, logger)
+        with build_downstream_client(kubeconfig) as downstream, \
+             tempfile.TemporaryDirectory(prefix="k8s-discovery-") as cache_dir:
+            dyn_client = build_dynamic_client(
+                downstream, cache_file=os.path.join(cache_dir, "discovery.json")
+            )
 
-    # Apply everything on every run; objects that already exist are skipped (409),
-    # so a partially failed previous run gets completed here.
-    longhorn_created = apply_manifests(
-        downstream, config[LONGHORN_MANIFEST].strip(), LONGHORN_NAMESPACE, logger
-    )
-    controllers_created = apply_manifests(
-        downstream, config[FILEBROWSER_MANIFEST].strip(), CONTROLLERS_NAMESPACE, logger
-    ) + apply_manifests(
-        downstream, config[PVC_CONTROLLER_MANIFEST].strip(), CONTROLLERS_NAMESPACE, logger
-    )
+            ensure_namespace(downstream, LONGHORN_NAMESPACE, logger)
+            ensure_namespace(downstream, CONTROLLERS_NAMESPACE, logger)
 
-    if longhorn_created:
-        logger.info(f"c4isr Longhorn has been deployed on cluster: {name}")
-    if controllers_created:
-        logger.info(f"c4isr FileBrowser and PVC controllers have been deployed on cluster: {name}")
-    if not longhorn_created and not controllers_created:
-        logger.debug(f"All c4isr apps already present on cluster {name}; nothing to do.")
+            # Apply everything on every run; objects that already exist are skipped (409),
+            # so a partially failed previous run gets completed here.
+            longhorn_created = apply_manifests(
+                dyn_client, config[LONGHORN_MANIFEST].strip(), LONGHORN_NAMESPACE, logger
+            )
+            controllers_created = apply_manifests(
+                dyn_client, config[FILEBROWSER_MANIFEST].strip(), CONTROLLERS_NAMESPACE, logger
+            ) + apply_manifests(
+                dyn_client, config[PVC_CONTROLLER_MANIFEST].strip(), CONTROLLERS_NAMESPACE, logger
+            )
 
-    # Optional ArgoCD stack, opted in per cluster via label.
-    if labels.get(ARGOCD_LABEL_KEY) == ARGOCD_LABEL_VALUE:
-        deploy_argocd_stack(name, kubeconfig, downstream, config, logger)
-    else:
-        logger.debug(f"Cluster {name} has no {ARGOCD_LABEL_KEY}: {ARGOCD_LABEL_VALUE} label; skipping ArgoCD.")
+            if longhorn_created:
+                logger.info(f"c4isr Longhorn has been deployed on cluster: {name}")
+            if controllers_created:
+                logger.info(f"c4isr FileBrowser and PVC controllers have been deployed on cluster: {name}")
+            if not longhorn_created and not controllers_created:
+                logger.debug(f"All c4isr apps already present on cluster {name}; nothing to do.")
+
+            # Optional ArgoCD stack, opted in per cluster via label.
+            # Checked after base apps so Longhorn/controllers are installed immediately
+            # even if the Jenkins job has not created argocd-repos-<cluster> yet.
+            if labels.get(ARGOCD_LABEL_KEY) == ARGOCD_LABEL_VALUE:
+                with build_management_client() as mgmt_client:
+                    repos = get_argocd_repos_secret(mgmt_client, name)
+                deploy_argocd_stack(name, kubeconfig, downstream, dyn_client, config, repos, logger)
+            else:
+                logger.debug(
+                    f"Cluster {name} has no {ARGOCD_LABEL_KEY}: {ARGOCD_LABEL_VALUE} label; skipping ArgoCD."
+                )
+    finally:
+        with _active_handlers_lock:
+            _active_handlers.pop(invocation_id, None)
 
 
-def deploy_argocd_stack(cluster_name: str, kubeconfig: str, downstream: ApiClient, config: dict, logger):
+def deploy_argocd_stack(
+    cluster_name: str,
+    kubeconfig: str,
+    downstream: ApiClient,
+    dyn_client: DynamicClient,
+    config: dict,
+    repos: dict,
+    logger,
+):
     """Install ArgoCD via Helm, register the cluster's repositories, apply the ApplicationSet."""
     require_keys(f"ConfigMap {CONFIGMAP_NAMESPACE}/{CONFIGMAP_NAME}", config, ARGOCD_CONFIG_KEYS)
-
-    # Read the per-cluster repos secret first, so we fail fast (and retry)
-    # before running the expensive helm install.
-    repos = get_argocd_repos_secret(cluster_name)
 
     helm_install_argocd(
         kubeconfig,
@@ -196,7 +368,7 @@ def deploy_argocd_stack(cluster_name: str, kubeconfig: str, downstream: ApiClien
         REVISION=repos["git-revision"],
         CLUSTER_NAME=cluster_name,
     )
-    appset_created = apply_manifests(downstream, appset_yaml, ARGOCD_NAMESPACE, logger)
+    appset_created = apply_manifests(dyn_client, appset_yaml, ARGOCD_NAMESPACE, logger)
     if appset_created:
         logger.info(f"ArgoCD ApplicationSet has been deployed on cluster: {cluster_name}")
 
@@ -250,13 +422,13 @@ def helm_install_argocd(kubeconfig: str, chart_repo: str, chart_version: str, va
     logger.info("ArgoCD helm release installed/upgraded.")
 
 
-def get_argocd_repos_secret(cluster_name: str) -> dict:
+def get_argocd_repos_secret(mgmt_client: ApiClient, cluster_name: str) -> dict:
     """Read the per-cluster ArgoCD repositories Secret created by the provisioning job.
 
     Retries until it exists, so ordering between the Jenkins job and cluster
     readiness does not matter.
     """
-    core = kubernetes.client.CoreV1Api()
+    core = kubernetes.client.CoreV1Api(mgmt_client)
     secret_name = f"{ARGOCD_REPOS_SECRET_PREFIX}{cluster_name}"
     try:
         secret = core.read_namespaced_secret(name=secret_name, namespace=ARGOCD_REPOS_SECRET_NAMESPACE)
@@ -269,6 +441,11 @@ def get_argocd_repos_secret(cluster_name: str) -> dict:
             )
         raise kopf.TemporaryError(
             f"Failed to read secret {ARGOCD_REPOS_SECRET_NAMESPACE}/{secret_name}: {e.status} {e.reason}",
+            delay=RETRY_DELAY_SECONDS,
+        )
+    except TRANSPORT_EXCEPTIONS as e:
+        raise kopf.TemporaryError(
+            f"Transport error reading secret {ARGOCD_REPOS_SECRET_NAMESPACE}/{secret_name}: {e}",
             delay=RETRY_DELAY_SECONDS,
         )
 
@@ -323,16 +500,26 @@ def create_argocd_repo_secrets(api_client: ApiClient, repos: dict, logger):
                 f"Failed to create ArgoCD repository secret {secret_name}: {e.status} {e.reason}",
                 delay=RETRY_DELAY_SECONDS,
             )
+        except TRANSPORT_EXCEPTIONS as e:
+            raise kopf.TemporaryError(
+                f"Transport error creating ArgoCD repository secret {secret_name}: {e}",
+                delay=RETRY_DELAY_SECONDS,
+            )
 
 
-def get_configmap_data() -> dict:
+def get_configmap_data(mgmt_client: ApiClient) -> dict:
     """Read the operator's ConfigMap from the management cluster."""
-    core = kubernetes.client.CoreV1Api()
+    core = kubernetes.client.CoreV1Api(mgmt_client)
     try:
         configmap = core.read_namespaced_config_map(name=CONFIGMAP_NAME, namespace=CONFIGMAP_NAMESPACE)
     except ApiException as e:
         raise kopf.TemporaryError(
             f"Failed to read ConfigMap {CONFIGMAP_NAMESPACE}/{CONFIGMAP_NAME}: {e.status} {e.reason}",
+            delay=RETRY_DELAY_SECONDS,
+        )
+    except TRANSPORT_EXCEPTIONS as e:
+        raise kopf.TemporaryError(
+            f"Transport error reading ConfigMap {CONFIGMAP_NAMESPACE}/{CONFIGMAP_NAME}: {e}",
             delay=RETRY_DELAY_SECONDS,
         )
     return configmap.data or {}
@@ -345,12 +532,12 @@ def require_keys(source: str, data: dict, keys):
         raise kopf.TemporaryError(f"{source} is missing keys: {missing}", delay=RETRY_DELAY_SECONDS)
 
 
-def get_downstream_kubeconfig(cluster_name: str) -> str:
+def get_downstream_kubeconfig(mgmt_client: ApiClient, cluster_name: str) -> str:
     """Fetch and decode the downstream cluster kubeconfig from its Rancher-managed secret.
 
     Retries (via kopf) if the secret does not exist yet.
     """
-    core = kubernetes.client.CoreV1Api()
+    core = kubernetes.client.CoreV1Api(mgmt_client)
     secret_name = f"{cluster_name}-kubeconfig"
     try:
         secret = core.read_namespaced_secret(name=secret_name, namespace=KUBECONFIG_SECRET_NAMESPACE)
@@ -364,6 +551,11 @@ def get_downstream_kubeconfig(cluster_name: str) -> str:
             f"Failed to read secret {KUBECONFIG_SECRET_NAMESPACE}/{secret_name}: {e.status} {e.reason}",
             delay=RETRY_DELAY_SECONDS,
         )
+    except TRANSPORT_EXCEPTIONS as e:
+        raise kopf.TemporaryError(
+            f"Transport error reading secret {KUBECONFIG_SECRET_NAMESPACE}/{secret_name}: {e}",
+            delay=RETRY_DELAY_SECONDS,
+        )
 
     kubeconfig_b64 = (secret.data or {}).get("value")
     if not kubeconfig_b64:
@@ -374,16 +566,38 @@ def get_downstream_kubeconfig(cluster_name: str) -> str:
     return base64.b64decode(kubeconfig_b64).decode("utf-8")
 
 
-def build_downstream_client(kubeconfig: str) -> ApiClient:
-    """Build a dedicated API client for the downstream cluster.
+def build_management_client() -> TimeoutApiClient:
+    """Build a timeout-bounded API client for the management cluster."""
+    return TimeoutApiClient()
+
+
+def build_downstream_client(kubeconfig: str) -> TimeoutApiClient:
+    """Build a dedicated, timeout-bounded API client for the downstream cluster.
 
     Deliberately does NOT touch the process-wide default configuration,
     which belongs to the management cluster.
     """
-    loader = KubeConfigLoader(config_dict=yaml.safe_load(kubeconfig))
-    config = Configuration()
-    loader.load_and_set(client_configuration=config)
-    return ApiClient(configuration=config)
+    try:
+        parsed = yaml.safe_load(kubeconfig)
+        if not isinstance(parsed, dict):
+            raise ConfigException("Downstream kubeconfig is empty or not a YAML mapping.")
+        loader = KubeConfigLoader(config_dict=parsed)
+        config = Configuration()
+        loader.load_and_set(client_configuration=config)
+        return TimeoutApiClient(configuration=config)
+    except (ConfigException, yaml.YAMLError, KeyError, TypeError) as e:
+        raise kopf.TemporaryError(f"Invalid downstream kubeconfig: {e}", delay=RETRY_DELAY_SECONDS)
+
+
+def build_dynamic_client(api_client: ApiClient, cache_file: str) -> DynamicClient:
+    """Build a DynamicClient for the downstream cluster with retryable discovery errors."""
+    try:
+        return DynamicClient(api_client, cache_file=cache_file)
+    except (ApiException, *TRANSPORT_EXCEPTIONS) as e:
+        raise kopf.TemporaryError(
+            f"Failed to discover API resources on downstream cluster: {e}",
+            delay=RETRY_DELAY_SECONDS,
+        )
 
 
 def ensure_namespace(api_client: ApiClient, namespace: str, logger):
@@ -403,15 +617,19 @@ def ensure_namespace(api_client: ApiClient, namespace: str, logger):
             f"Failed to create namespace {namespace}: {e.status} {e.reason}",
             delay=RETRY_DELAY_SECONDS,
         )
+    except TRANSPORT_EXCEPTIONS as e:
+        raise kopf.TemporaryError(
+            f"Transport error creating namespace {namespace}: {e}",
+            delay=RETRY_DELAY_SECONDS,
+        )
 
 
-def apply_manifests(api_client: ApiClient, manifests_yaml: str, namespace: str, logger) -> int:
+def apply_manifests(dyn_client: DynamicClient, manifests_yaml: str, namespace: str, logger) -> int:
     """Create all objects from a multi-document YAML string on the downstream cluster.
 
     Objects that already exist are skipped, so this is safe to re-run.
     Returns the number of objects actually created.
     """
-    dyn_client = DynamicClient(api_client)
     created = 0
     for obj in yaml.safe_load_all(manifests_yaml):
         if not obj:  # Skip empty documents.
@@ -419,17 +637,24 @@ def apply_manifests(api_client: ApiClient, manifests_yaml: str, namespace: str, 
 
         kind = obj["kind"]
         obj_name = obj.get("metadata", {}).get("name", "<unnamed>")
-        resource = dyn_client.resources.get(api_version=obj["apiVersion"], kind=kind)
+        target_namespace = obj.get("metadata", {}).get("namespace") or namespace
+
         try:
-            resource.create(body=obj, namespace=namespace)
+            resource = dyn_client.resources.get(api_version=obj["apiVersion"], kind=kind)
+            resource.create(body=obj, namespace=target_namespace)
             created += 1
-            logger.debug(f"Created {kind}/{obj_name} in namespace {namespace}.")
+            logger.debug(f"Created {kind}/{obj_name} in namespace {target_namespace}.")
         except ApiException as e:
             if e.status == 409:
-                logger.debug(f"{kind}/{obj_name} already exists in {namespace}; skipping.")
+                logger.debug(f"{kind}/{obj_name} already exists in {target_namespace}; skipping.")
                 continue
             raise kopf.TemporaryError(
-                f"Failed to create {kind}/{obj_name} in {namespace}: {e.status} {e.reason}",
+                f"Failed to create {kind}/{obj_name} in {target_namespace}: {e.status} {e.reason}",
+                delay=RETRY_DELAY_SECONDS,
+            )
+        except (ResourceNotFoundError, ResourceNotUniqueError, *TRANSPORT_EXCEPTIONS) as e:
+            raise kopf.TemporaryError(
+                f"Failed to resolve/create {kind}/{obj_name} in {target_namespace}: {e}",
                 delay=RETRY_DELAY_SECONDS,
             )
     return created
