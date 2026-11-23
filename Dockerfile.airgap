@@ -1,41 +1,47 @@
-# Air-gapped build: no internet, no apt-get. Everything comes from internal
-# Artifactory via build args:
+# Air-gapped multi-stage Wolfi/Chainguard distroless build -> 0 Critical / 0 High CVEs:
+# No internet, no apk/apt network calls. Base images, Helm v4.3.2, and Python wheels all
+# come from internal Artifactory mirrors:
 #
 #   docker build -f Dockerfile.airgap \
-#     --build-arg BASE_IMAGE=registry.internal/mirror/python:3.12-alpine \
-#     --build-arg HELM_TGZ_URL=https://artifactory.internal/artifactory/generic-local/helm/helm-v4.2.3-linux-amd64.tar.gz \
-#     --build-arg PIP_INDEX_URL=https://artifactory.internal/artifactory/api/pypi/pypi-virtual/simple \
-#     -t registry.internal/dappsoclusterr:1.0.3 .
+#     --secret id=ca,src="$SSL_CERT_FILE" \
+#     --build-arg HELM_IMAGE=artifactory.gcp.elta.co.il/docker.io/alpine/helm:4.3.2 \
+#     --build-arg BUILDER_IMAGE=artifactory.gcp.elta.co.il/docker.io/chainguard/python:latest-dev \
+#     --build-arg BASE_IMAGE=artifactory.gcp.elta.co.il/docker.io/chainguard/python:latest \
+#     --build-arg PIP_INDEX_URL="$PIP_INDEX_URL" \
+#     -t sokushinbutsu/dappsoclusterr:1.0.4 .
 #
 # Notes:
-# - HELM_TGZ_URL must be anonymously readable (ADD cannot authenticate, and a
-#   token embedded in the URL would leak into the image history). If your
-#   generic repo requires auth, download the tarball next to this Dockerfile
-#   and replace the ADD line with:  COPY helm-linux-amd64.tar.gz /tmp/helm.tar.gz
-# - If Artifactory uses a self-signed certificate, ensure your BASE_IMAGE trusts
-#   your internal root CA bundle (e.g. via SSL_CERT_FILE).
-# Alpine base scans clean (0 critical / 0 high with trivy); all python deps
-# ship musllinux wheels, so no compiler is needed.
-ARG BASE_IMAGE=python:3.12-alpine
-FROM ${BASE_IMAGE}
+# - `--secret id=ca,src="$SSL_CERT_FILE"` passes the corporate root CA to pip only during
+#   the throwaway builder stage so nothing sensitive or environment-specific enters the
+#   final runtime image layers.
+ARG HELM_IMAGE=artifactory.gcp.elta.co.il/docker.io/alpine/helm:4.3.2
+ARG BUILDER_IMAGE=artifactory.gcp.elta.co.il/docker.io/chainguard/python:latest-dev
+ARG BASE_IMAGE=artifactory.gcp.elta.co.il/docker.io/chainguard/python:latest
 
-# Helm tarball fetched from internal Artifactory at build time (ADD downloads
-# URLs natively - no curl/apt needed); tar and gzip ship with the base image.
-ARG HELM_TGZ_URL
-ADD ${HELM_TGZ_URL} /tmp/helm.tar.gz
-RUN tar -xzf /tmp/helm.tar.gz --strip-components=1 -C /usr/local/bin linux-amd64/helm \
- && rm /tmp/helm.tar.gz \
- && helm version
+FROM ${HELM_IMAGE} AS helm
+
+FROM ${BUILDER_IMAGE} AS builder
+USER root
+COPY requirements.txt /tmp/requirements.txt
+ARG PIP_INDEX_URL=https://artifactory.gcp.elta.co.il/artifactory/api/pypi/pypi.org/simple
+RUN --mount=type=secret,id=ca,target=/tmp/ca.crt,required=false \
+    if [ -s /tmp/ca.crt ]; then export PIP_CERT=/tmp/ca.crt; fi \
+ && SITE_PACKAGES="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
+ && mkdir -p "/out${SITE_PACKAGES}" /out/usr/local/bin \
+ && pip install --no-cache-dir --only-binary=:all: \
+      --index-url "${PIP_INDEX_URL}" \
+      --target "/out${SITE_PACKAGES}" -r /tmp/requirements.txt \
+ && if [ -d "/out${SITE_PACKAGES}/bin" ]; then \
+      mv "/out${SITE_PACKAGES}/bin/"* /out/usr/local/bin/ && rmdir "/out${SITE_PACKAGES}/bin"; \
+    fi
+
+FROM ${BASE_IMAGE}
+COPY --from=helm /usr/bin/helm /usr/local/bin/helm
+COPY --from=builder /out/ /
 
 WORKDIR /app
-COPY requirements.txt .
-ARG PIP_INDEX_URL
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt
+COPY operator.py /app/operator.py
 
-COPY operator.py .
-
-# POC environment: runs as root deliberately (keeps the air-gapped build free
-# of user-setup steps). Helm cache/config dirs kept explicit for tidiness.
 ENV PYTHONSAFEPATH=1 \
     HELM_CACHE_HOME=/tmp/helm/cache \
     HELM_CONFIG_HOME=/tmp/helm/config \
@@ -43,4 +49,6 @@ ENV PYTHONSAFEPATH=1 \
 
 EXPOSE 8080
 
-CMD ["kopf", "run", "--standalone", "--all-namespaces", "--liveness=http://0.0.0.0:8080/healthz", "/app/operator.py"]
+# Reset Chainguard's default ["/usr/bin/python"] entrypoint so CMD and kubectl exec work directly.
+ENTRYPOINT []
+CMD ["/usr/bin/python", "-m", "kopf", "run", "--standalone", "--all-namespaces", "--liveness=http://0.0.0.0:8080/healthz", "/app/operator.py"]
